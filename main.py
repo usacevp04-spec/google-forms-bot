@@ -18,35 +18,49 @@ from telegram.ext import (
 )
 
 
-# =========================
+# =========================================================
 # НАСТРОЙКИ
-# =========================
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
 PORT = int(os.getenv("PORT", "10000"))
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 
-# =========================
+# =========================================================
 # ЛОГИРОВАНИЕ
-# =========================
+# =========================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 
 logger = logging.getLogger(__name__)
 
 
-# =========================
-# TELEGRAM
-# =========================
+# =========================================================
+# TELEGRAM APPLICATION
+# =========================================================
 
-telegram_app = Application.builder().token(BOT_TOKEN).build()
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set!")
+
+telegram_app = (
+    Application.builder()
+    .token(BOT_TOKEN)
+    .build()
+)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# /START
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
 
     await update.message.reply_text(
         "👋 Привет!\n\n"
@@ -55,27 +69,46 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =========================================================
+# ОБРАБОТКА СООБЩЕНИЙ
+# =========================================================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
 
     text = update.message.text
 
     if not text:
         return
 
+    text = text.strip()
+
     if "docs.google.com/forms" in text:
 
         await update.message.reply_text(
-            "🔗 Ссылка получена!\n\n"
-            "Пока что я нахожусь на стадии разработки.\n"
-            "Следующим шагом научимся получать изображения из формы."
+            "🔗 Ссылка на Google Форму получена!\n\n"
+            "Пока я только принимаю ссылку.\n"
+            "Следующим этапом подключим получение "
+            "изображений из формы."
         )
 
     else:
 
         await update.message.reply_text(
-            "❌ Пожалуйста, отправь публичную ссылку на Google Форму."
+            "❌ Это не похоже на ссылку Google Forms.\n\n"
+            "Отправь публичную ссылку вида:\n"
+            "https://docs.google.com/forms/..."
         )
 
+
+# =========================================================
+# TELEGRAM HANDLERS
+# =========================================================
 
 telegram_app.add_handler(
     CommandHandler("start", start)
@@ -89,23 +122,40 @@ telegram_app.add_handler(
 )
 
 
-# =========================
+# =========================================================
 # WEBHOOK
-# =========================
+# =========================================================
 
 async def telegram_webhook(request: Request):
 
-    data = await request.json()
+    try:
 
-    update = Update.de_json(
-        data,
-        telegram_app.bot
-    )
+        data = await request.json()
 
-    await telegram_app.update_queue.put(update)
+        update = Update.de_json(
+            data,
+            telegram_app.bot
+        )
 
-    return PlainTextResponse("OK")
+        await telegram_app.update_queue.put(update)
 
+        return PlainTextResponse("OK")
+
+    except Exception:
+
+        logger.exception(
+            "Error while processing Telegram webhook"
+        )
+
+        return PlainTextResponse(
+            "ERROR",
+            status_code=500
+        )
+
+
+# =========================================================
+# HEALTH CHECK
+# =========================================================
 
 async def health(request: Request):
 
@@ -114,29 +164,65 @@ async def health(request: Request):
     )
 
 
+# =========================================================
+# ROUTES
+# =========================================================
+
 routes = [
-    Route("/", health),
-    Route("/telegram", telegram_webhook, methods=["POST"]),
+    Route(
+        "/",
+        health,
+        methods=["GET", "HEAD"]
+    ),
+
+    Route(
+        "/telegram",
+        telegram_webhook,
+        methods=["POST"]
+    ),
 ]
 
 
-app = Starlette(routes=routes)
+# =========================================================
+# STARLETTE APP
+# =========================================================
+
+app = Starlette(
+    routes=routes
+)
 
 
-# =========================
-# ЗАПУСК TELEGRAM
-# =========================
+# =========================================================
+# STARTUP
+# =========================================================
+
 @app.on_event("startup")
 async def startup():
 
-    logger.info("Starting Telegram bot...")
+    logger.info(
+        "Starting Telegram bot..."
+    )
 
     await telegram_app.initialize()
+
     await telegram_app.start()
 
-    webhook_url = os.getenv("WEBHOOK_URL")
+    logger.info(
+        "Telegram application started"
+    )
 
-    if webhook_url:
+    webhook_url = WEBHOOK_URL
+
+    if not webhook_url:
+
+        logger.error(
+            "WEBHOOK_URL is not set!"
+        )
+
+        return
+
+    try:
+
         await telegram_app.bot.set_webhook(
             url=webhook_url
         )
@@ -144,23 +230,49 @@ async def startup():
         logger.info(
             f"Webhook set: {webhook_url}"
         )
-    else:
-        logger.warning(
-            "WEBHOOK_URL is not set!"
+
+    except Exception:
+
+        logger.exception(
+            "Failed to set Telegram webhook"
+        )
+
+        raise
+
+
+# =========================================================
+# SHUTDOWN
+# =========================================================
+
+@app.on_event("shutdown")
+async def shutdown():
+
+    logger.info(
+        "Stopping Telegram bot..."
+    )
+
+    try:
+
+        if telegram_app.running:
+            await telegram_app.stop()
+
+    finally:
+
+        await telegram_app.shutdown()
+
+        logger.info(
+            "Telegram bot stopped"
         )
 
 
-    await telegram_app.shutdown()
-
-
-# =========================
+# =========================================================
 # LOCAL RUN
-# =========================
+# =========================================================
 
 if __name__ == "__main__":
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=PORT
+        port=PORT,
     )
