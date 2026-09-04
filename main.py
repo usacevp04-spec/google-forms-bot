@@ -1,19 +1,18 @@
 import os
-import re
 import io
+import re
 import logging
-from urllib.parse import urljoin
 
 import requests
 import uvicorn
 
 from bs4 import BeautifulSoup
-
 from PIL import Image
 
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse
+from starlette.routing import Route
 
 from telegram import Update
 from telegram.ext import (
@@ -35,6 +34,9 @@ WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set!")
+
+if not WEBHOOK_URL:
+    raise RuntimeError("WEBHOOK_URL is not set!")
 
 
 # =========================================================
@@ -77,29 +79,52 @@ telegram_app = (
 
 
 # =========================================================
-# ПРОВЕРКА ССЫЛКИ
+# /START
+# =========================================================
+
+async def start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    await update.message.reply_text(
+        "👋 Привет!\n\n"
+        "Я бот для обработки Google Forms.\n\n"
+        "Отправь мне публичную ссылку "
+        "на Google Форму."
+    )
+
+
+# =========================================================
+# ПРОВЕРКА GOOGLE FORMS
 # =========================================================
 
 def is_google_forms_url(url: str) -> bool:
 
     url = url.strip()
 
-    patterns = [
-        r"https?://docs\.google\.com/forms/",
-        r"https?://forms\.gle/",
-    ]
-
-    return any(
-        re.search(pattern, url, re.IGNORECASE)
-        for pattern in patterns
+    return bool(
+        re.match(
+            r"^https?://"
+            r"(docs\.google\.com/forms/|forms\.gle/)",
+            url,
+            re.IGNORECASE
+        )
     )
 
 
 # =========================================================
-# ПОЛУЧЕНИЕ HTML ФОРМЫ
+# ПОЛУЧЕНИЕ HTML
 # =========================================================
 
 def get_form_html(url: str) -> str:
+
+    logger.info(
+        f"Opening Google Form: {url}"
+    )
 
     response = http.get(
         url,
@@ -109,6 +134,10 @@ def get_form_html(url: str) -> str:
 
     response.raise_for_status()
 
+    logger.info(
+        f"Google Form HTTP status: {response.status_code}"
+    )
+
     return response.text
 
 
@@ -116,7 +145,10 @@ def get_form_html(url: str) -> str:
 # ПОИСК ИЗОБРАЖЕНИЙ
 # =========================================================
 
-def extract_images(html: str, base_url: str):
+def extract_images(
+    html: str,
+    base_url: str
+):
 
     soup = BeautifulSoup(
         html,
@@ -141,41 +173,52 @@ def extract_images(html: str, base_url: str):
         if src.startswith("data:"):
             continue
 
-        full_url = urljoin(
+        # Преобразуем относительный URL
+        # в полный.
+        from urllib.parse import urljoin
+
+        image_url = urljoin(
             base_url,
             src
         )
 
-        # Убираем технические/служебные изображения.
-        lowered = full_url.lower()
+        lowered = image_url.lower()
 
+        # Отбрасываем технические картинки.
         ignored = [
             "googlelogo",
             "favicon",
-            "icon",
+            "captcha",
             "avatar",
             "profile",
-            "captcha",
         ]
 
         if any(
-            item in lowered
-            for item in ignored
+            word in lowered
+            for word in ignored
         ):
             continue
 
-        # Не добавляем дубликаты.
-        if full_url not in images:
-            images.append(full_url)
+        if image_url not in images:
+
+            images.append(
+                image_url
+            )
 
     return images
 
 
 # =========================================================
-# СКАЧИВАНИЕ ИЗОБРАЖЕНИЯ В RAM
+# СКАЧИВАНИЕ КАРТИНКИ В ПАМЯТЬ
 # =========================================================
 
-def download_image_to_memory(image_url: str):
+def download_image(
+    image_url: str
+):
+
+    logger.info(
+        f"Downloading image: {image_url}"
+    )
 
     response = http.get(
         image_url,
@@ -186,7 +229,6 @@ def download_image_to_memory(image_url: str):
 
     image_bytes = response.content
 
-    # Проверяем, что это действительно изображение.
     image = Image.open(
         io.BytesIO(image_bytes)
     )
@@ -197,17 +239,16 @@ def download_image_to_memory(image_url: str):
 
 
 # =========================================================
-# ПОКА ВРЕМЕННЫЙ OCR
+# OCR
 # =========================================================
 
-def recognize_text(image_bytes: bytes) -> str:
+def recognize_text(
+    image_bytes: bytes
+) -> str:
 
-    # Здесь пока специально оставляем заглушку.
-    #
-    # На следующем этапе сюда подключим
-    # настоящий OCR.
-    #
-    # Картинка при этом находится только в RAM.
+    # OCR подключим следующим этапом.
+    # Сейчас проверяем сам механизм:
+    # Google Form → изображение → RAM.
 
     return (
         "[OCR пока не подключён]\n"
@@ -216,14 +257,12 @@ def recognize_text(image_bytes: bytes) -> str:
 
 
 # =========================================================
-# ОБРАБОТКА GOOGLE FORM
+# ОБРАБОТКА ФОРМЫ
 # =========================================================
 
-def process_google_form(url: str):
-
-    logger.info(
-        f"Processing Google Form: {url}"
-    )
+def process_google_form(
+    url: str
+):
 
     html = get_form_html(url)
 
@@ -233,7 +272,7 @@ def process_google_form(url: str):
     )
 
     logger.info(
-        f"Found {len(images)} images"
+        f"Found images: {len(images)}"
     )
 
     results = []
@@ -247,10 +286,13 @@ def process_google_form(url: str):
             f"Processing image #{index}"
         )
 
+        image_bytes = None
+        image = None
+
         try:
 
             image_bytes, image = (
-                download_image_to_memory(
+                download_image(
                     image_url
                 )
             )
@@ -268,14 +310,10 @@ def process_google_form(url: str):
                 "height": height,
             })
 
-            # Удаляем ссылки на изображение.
-            del image
-            del image_bytes
-
         except Exception as e:
 
             logger.exception(
-                f"Failed to process image #{index}"
+                f"Image #{index} processing error"
             )
 
             results.append({
@@ -287,26 +325,34 @@ def process_google_form(url: str):
                 "height": 0,
             })
 
+        finally:
+
+            # После обработки освобождаем
+            # изображение из памяти.
+            image = None
+            image_bytes = None
+
     return results
 
 
 # =========================================================
-# ФОРМАТИРОВАНИЕ РЕЗУЛЬТАТА
+# ФОРМАТИРОВАНИЕ
 # =========================================================
 
-def format_results(results):
+def format_results(
+    results
+):
 
     if not results:
 
         return (
-            "❌ Изображения в форме не найдены."
+            "❌ В форме изображения не найдены."
         )
 
-    parts = []
-
-    parts.append(
-        f"🖼 Найдено изображений: {len(results)}\n"
-    )
+    parts = [
+        f"🖼 Найдено изображений: "
+        f"{len(results)}\n"
+    ]
 
     for item in results:
 
@@ -314,32 +360,15 @@ def format_results(results):
         text = item["text"]
 
         parts.append(
-            f"{number}. Вопрос:\n"
-            f"{text}\n\n"
+            f"\n{number}. Вопрос:\n"
+            f"{text}\n"
         )
 
     return "".join(parts)
 
 
 # =========================================================
-# /START
-# =========================================================
-
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "👋 Привет!\n\n"
-        "Я бот для обработки Google Forms.\n\n"
-        "Отправь мне публичную ссылку "
-        "на Google Форму."
-    )
-
-
-# =========================================================
-# ОБРАБОТКА ССЫЛКИ
+# ОБРАБОТКА СООБЩЕНИЯ
 # =========================================================
 
 async def handle_message(
@@ -360,9 +389,9 @@ async def handle_message(
     if not is_google_forms_url(text):
 
         await update.message.reply_text(
-            "❌ Не вижу публичную ссылку "
-            "на Google Forms.\n\n"
-            "Отправь ссылку вида:\n"
+            "❌ Отправь публичную ссылку "
+            "на Google Form.\n\n"
+            "Например:\n"
             "https://docs.google.com/forms/..."
         )
 
@@ -371,7 +400,7 @@ async def handle_message(
     processing_message = (
         await update.message.reply_text(
             "🔎 Открываю Google Form...\n\n"
-            "Ищу изображения заданий."
+            "Ищу изображения заданий..."
         )
     )
 
@@ -385,14 +414,14 @@ async def handle_message(
             results
         )
 
-        # Telegram имеет ограничение длины сообщения.
+        # Telegram ограничивает размер
+        # одного сообщения.
         if len(answer) > 3900:
 
-            answer = answer[:3800]
-
-            answer += (
-                "\n\n⚠️ Результат слишком "
-                "большой и был сокращён."
+            answer = (
+                answer[:3800]
+                + "\n\n"
+                "⚠️ Результат слишком большой."
             )
 
         await processing_message.edit_text(
@@ -402,7 +431,7 @@ async def handle_message(
     except requests.RequestException as e:
 
         logger.exception(
-            "Network error"
+            "Google Form request error"
         )
 
         await processing_message.edit_text(
@@ -413,17 +442,17 @@ async def handle_message(
     except Exception as e:
 
         logger.exception(
-            "Form processing error"
+            "Unexpected processing error"
         )
 
         await processing_message.edit_text(
-            "❌ Произошла ошибка при обработке формы.\n\n"
+            "❌ Произошла ошибка.\n\n"
             f"Ошибка: {e}"
         )
 
 
 # =========================================================
-# HANDLERS
+# TELEGRAM HANDLERS
 # =========================================================
 
 telegram_app.add_handler(
@@ -469,7 +498,7 @@ async def telegram_webhook(
     except Exception:
 
         logger.exception(
-            "Webhook error"
+            "Telegram webhook error"
         )
 
         return PlainTextResponse(
@@ -492,20 +521,30 @@ async def health(
 
 
 # =========================================================
+# ROUTES
+# =========================================================
+
+routes = [
+    Route(
+        "/",
+        endpoint=health,
+        methods=["GET", "HEAD"],
+    ),
+
+    Route(
+        "/telegram",
+        endpoint=telegram_webhook,
+        methods=["POST"],
+    ),
+]
+
+
+# =========================================================
 # STARLETTE
 # =========================================================
 
 app = Starlette(
-    routes=[
-        (
-            "/",
-            health
-        ),
-        (
-            "/telegram",
-            telegram_webhook
-        ),
-    ]
+    routes=routes
 )
 
 
@@ -527,12 +566,6 @@ async def startup():
     logger.info(
         "Telegram application started"
     )
-
-    if not WEBHOOK_URL:
-
-        raise RuntimeError(
-            "WEBHOOK_URL is not set!"
-        )
 
     await telegram_app.bot.set_webhook(
         url=WEBHOOK_URL
