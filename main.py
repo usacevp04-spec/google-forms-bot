@@ -126,23 +126,29 @@ app = Starlette(routes=routes)
 # =========================
 # ЗАПУСК TELEGRAM
 # =========================
-
 @app.on_event("startup")
 async def startup():
 
     logger.info("Starting Telegram bot...")
 
     await telegram_app.initialize()
-
     await telegram_app.start()
 
+    webhook_url = os.getenv("WEBHOOK_URL")
 
-@app.on_event("shutdown")
-async def shutdown():
+    if webhook_url:
+        await telegram_app.bot.set_webhook(
+            url=webhook_url
+        )
 
-    logger.info("Stopping Telegram bot...")
+        logger.info(
+            f"Webhook set: {webhook_url}"
+        )
+    else:
+        logger.warning(
+            "WEBHOOK_URL is not set!"
+        )
 
-    await telegram_app.stop()
 
     await telegram_app.shutdown()
 
